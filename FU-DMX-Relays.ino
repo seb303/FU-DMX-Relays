@@ -56,6 +56,14 @@ const unsigned long RELAY_DWELL_MS = 200;
 // polling controller will just ask again shortly).
 const int MAX_PENDING_ARTPOLL_REPLIES = 8;
 
+// Fixed IP configuration for the fallback access point. Forced
+// explicitly rather than relying on the WiFi library's own default
+// (which happens to already be 192.168.4.1/24, but that's an
+// implementation detail we shouldn't depend on going forward).
+const IPAddress AP_LOCAL_IP(192, 168, 4, 1);
+const IPAddress AP_GATEWAY_IP(192, 168, 4, 1);
+const IPAddress AP_SUBNET_MASK(255, 255, 255, 0);
+
 // ============================================================
 // WIFI
 // ============================================================
@@ -116,11 +124,16 @@ bool artnetStarted = false;
 
 unsigned long artPollReplyCounter = 0;
 
-// Timestamp (millis()) of the most recently received valid
-// Art-Net packet (any type), for status-page display. everReceived
-// distinguishes "never" from a genuine 0ms-ago reading.
-unsigned long lastArtnetPacketMs = 0;
-bool everReceivedArtnetPacket = false;
+// Timestamps (millis()) of the most recently received ArtPoll and
+// ArtDMX packets, tracked separately so the status page can show
+// whether the node is actually receiving DMX data or only being
+// polled. everReceived* distinguishes "never" from a genuine
+// 0ms-ago reading.
+unsigned long lastArtPollMs = 0;
+bool everReceivedArtPoll = false;
+
+unsigned long lastArtDmxMs = 0;
+bool everReceivedArtDmx = false;
 
 // ----------------------------------------------------------
 // Pending ArtPollReply queue
@@ -179,6 +192,7 @@ String formatDuration(unsigned long ms);
 String describeRSSI(int rssi);
 
 String htmlEscape(const String &input);
+bool isPrintableAscii(const String &input);
 String getFormValue(const char *name);
 
 void loadConfiguration();
@@ -418,6 +432,30 @@ String htmlEscape(const String &input)
   }
 
   return output;
+}
+
+// Mirrors the client-side pattern='[ -~]*' constraint on the free-
+// text config fields. A byte length check alone isn't sufficient:
+// the browser's maxlength counts characters, while our server-side
+// checks count bytes, and those only agree if every character is a
+// single-byte one - i.e. printable ASCII. This also guards
+// artnetNodeName specifically, which is copied into fixed-width,
+// null-terminated fields in the ArtPollReply packet where a
+// multi-byte UTF-8 character could corrupt the field or get cut
+// mid-character.
+bool isPrintableAscii(const String &input)
+{
+  for (size_t i = 0; i < input.length(); i++)
+  {
+    uint8_t c = (uint8_t)input[i];
+
+    if (c < 0x20 || c > 0x7E)
+    {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 // ============================================================
@@ -669,11 +707,19 @@ void startAccessPoint()
   // interface to have been started.
   WiFi.mode(WIFI_AP_STA);
 
+  // Force the AP's IP configuration explicitly rather than relying
+  // on the library default, so it's guaranteed and documented
+  // rather than incidental.
+  bool configResult = WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY_IP, AP_SUBNET_MASK);
+
   bool result = WiFi.softAP(apSSID.c_str());
 
 #if DEBUG
   DBG_PRINT("[WIFI] Starting access point: ");
   DBG_PRINTLN(apSSID);
+
+  DBG_PRINT("[WIFI] AP config result: ");
+  DBG_PRINTLN(configResult ? "SUCCESS" : "FAILED");
 
   DBG_PRINT("[WIFI] AP start result: ");
   DBG_PRINTLN(result ? "SUCCESS" : "FAILED");
@@ -1289,12 +1335,6 @@ void handleArtNet()
     return;
   }
 
-  // Recognised as a genuine Art-Net packet - record it for the
-  // status page's "time since last Art-Net packet" display,
-  // regardless of packet type or whether it's for our universe.
-  lastArtnetPacketMs = millis();
-  everReceivedArtnetPacket = true;
-
   uint16_t opcode = readUInt16LE(packet + 8);
 
 #if DEBUG_ARTNET && DEBUG_VERBOSE
@@ -1313,6 +1353,69 @@ void handleArtNet()
 
   if (opcode == 0x2000)
   {
+    // A structurally valid ArtPoll is at least 14 bytes:
+    // ID[8] + OpCode[2] + ProtVerHi/Lo[2] + TalkToMe[1] + Priority[1].
+    // Anything shorter is malformed - drop it, and don't count it
+    // as a received ArtPoll for the status page.
+    if (packetSize < 14 || bytesRead < 14)
+    {
+#if DEBUG_ARTNET && DEBUG_VERBOSE
+      ARTNET_PRINTLN("[ARTNET] ArtPoll too short. Ignoring.");
+#endif
+      return;
+    }
+
+    uint16_t protocolVersion = readUInt16BE(packet + 10);
+    uint8_t flags = packet[12];
+
+    // TalkToMe bit 5 (value 0x10) is Targeted Mode: the poll only
+    // wants a reply from nodes whose Port-Address falls within
+    // [TargetPortAddressBottom, TargetPortAddressTop]. Those two
+    // extra 16-bit fields only exist when this bit is set.
+    bool targetedMode = (flags & 0x10) != 0;
+
+    if (targetedMode)
+    {
+      // Targeted Mode is an Art-Net 4 feature and requires the
+      // packet to actually carry the extra range fields (18 bytes
+      // total). A poll claiming Targeted Mode from an older
+      // protocol version, or one too short to hold the range, is
+      // internally inconsistent - treat it as malformed.
+      if (protocolVersion < 14 || packetSize < 18 || bytesRead < 18)
+      {
+#if DEBUG_ARTNET && DEBUG_VERBOSE
+        ARTNET_PRINTLN("[ARTNET] Malformed targeted ArtPoll. Ignoring.");
+#endif
+        return;
+      }
+
+      uint16_t targetTop = readUInt16BE(packet + 14);
+      uint16_t targetBottom = readUInt16BE(packet + 16);
+
+      uint16_t rangeLow = targetTop < targetBottom ? targetTop : targetBottom;
+      uint16_t rangeHigh = targetTop < targetBottom ? targetBottom : targetTop;
+
+      if (artnetUniverse < rangeLow || artnetUniverse > rangeHigh)
+      {
+#if DEBUG_ARTNET && DEBUG_VERBOSE
+        ARTNET_PRINT("[ARTNET] Targeted ArtPoll range ");
+        ARTNET_PRINT(rangeLow);
+        ARTNET_PRINT("-");
+        ARTNET_PRINT(rangeHigh);
+        ARTNET_PRINTLN(" does not include our universe. Not replying.");
+#endif
+        // Not addressed to us - a valid poll, just not one we
+        // should count or reply to.
+        return;
+      }
+    }
+
+    // Either untargeted (addressed to every node) or targeted at a
+    // range that includes our universe - this is the point where
+    // it counts as "an ArtPoll for us" for the status page.
+    lastArtPollMs = millis();
+    everReceivedArtPoll = true;
+
 #if DEBUG_ARTNET && DEBUG_VERBOSE
     ARTNET_PRINTLN("[ARTNET] ArtPoll received.");
 #endif
@@ -1337,6 +1440,10 @@ void handleArtNet()
     return;
   }
 
+  // Recognised as carrying DMX data - the "Last DMX data" tracking
+  // (below, after we've confirmed the universe matches) only counts
+  // it once we know it's actually addressed to us.
+
   // ArtDMX minimum packet length is 18 bytes.
 
   if (packetSize < 18 || bytesRead < 18)
@@ -1349,6 +1456,14 @@ void handleArtNet()
 
   uint16_t protocolVersion = readUInt16BE(packet + 10);
 
+  // Sequence is used by controllers/nodes that need to detect and
+  // discard out-of-order or duplicate packets (e.g. when merging
+  // ArtDMX from multiple sources). We don't merge, interpolate, or
+  // otherwise rely on packet ordering: each received frame is
+  // treated independently and the two relay channels simply take
+  // whichever value arrived most recently, so there's nothing here
+  // that "out of order" could corrupt. It's read (for the verbose
+  // debug log below) but intentionally never checked.
   uint8_t sequence = packet[12];
 
   uint16_t universe = readUInt16LE(packet + 14);
@@ -1405,6 +1520,11 @@ void handleArtNet()
 #endif
     return;
   }
+
+  // Addressed to our universe - this is "DMX data for us" for the
+  // status page's "Last DMX data" reading.
+  lastArtDmxMs = millis();
+  everReceivedArtDmx = true;
 
   // ----------------------------------------------------------
   // Relay 1
@@ -1735,10 +1855,21 @@ void handleRoot()
   html += htmlEscape(bootResetReasonText);
   html += "</span></div>";
 
-  html += "<div class='status__row'><span class='status__label'>Last Art-Net packet</span><span class='status__value'>";
-  if (everReceivedArtnetPacket)
+  html += "<div class='status__row'><span class='status__label'>Last DMX data</span><span class='status__value'>";
+  if (everReceivedArtDmx)
   {
-    html += formatDuration(millis() - lastArtnetPacketMs) + " ago";
+    html += formatDuration(millis() - lastArtDmxMs) + " ago";
+  }
+  else
+  {
+    html += "Never";
+  }
+  html += "</span></div>";
+
+  html += "<div class='status__row'><span class='status__label'>Last ArtPoll</span><span class='status__value'>";
+  if (everReceivedArtPoll)
+  {
+    html += formatDuration(millis() - lastArtPollMs) + " ago";
   }
   else
   {
@@ -1767,7 +1898,7 @@ void handleRoot()
 
   html += "<div class='field'>";
   html += "<label class='field__label' for='nodename'>Node Name (maximum 17 characters)</label>";
-  html += "<input class='field__input' type='text' id='nodename' name='nodename' required minlength='1' maxlength='17' value='";
+  html += "<input class='field__input' type='text' id='nodename' name='nodename' required minlength='1' maxlength='17' pattern='[ -~]*' title='ASCII characters only' value='";
   html += htmlEscape(artnetNodeName);
   html += "'>";
   html += "</div>";
@@ -1809,7 +1940,7 @@ void handleRoot()
 
     html += "<div class='field'>";
     html += "<label class='field__label' for='" + ssidId + "'>Network " + String(i + 1) + " SSID</label>";
-    html += "<input class='field__input' type='text' id='" + ssidId + "' name='" + ssidId + "' maxlength='32' value='";
+    html += "<input class='field__input' type='text' id='" + ssidId + "' name='" + ssidId + "' maxlength='32' pattern='[ -~]*' title='ASCII characters only' value='";
     html += htmlEscape(wifiSSID[i]);
     html += "'>";
     html += "</div>";
@@ -1817,7 +1948,7 @@ void handleRoot()
     html += "<div class='field'>";
     html += "<label class='field__label' for='" + passId + "'>Password</label>";
     html += "<div class='password-field'>";
-    html += "<input class='field__input password-field__input' type='password' id='" + passId + "' name='" + passId + "' maxlength='32' value='";
+    html += "<input class='field__input password-field__input' type='password' id='" + passId + "' name='" + passId + "' maxlength='32' pattern='[ -~]*' title='ASCII characters only' value='";
     html += htmlEscape(wifiPassword[i]);
     html += "'>";
     html += "<label class='password-field__toggle'><input type='checkbox' onchange=\"togglePassword('" + passId + "', this.checked)\"> Show</label>";
@@ -1827,7 +1958,7 @@ void handleRoot()
 
   html += "<div class='field'>";
   html += "<label class='field__label' for='apssid'>Access Point SSID</label>";
-  html += "<input class='field__input' type='text' id='apssid' name='apssid' required minlength='1' maxlength='32' value='";
+  html += "<input class='field__input' type='text' id='apssid' name='apssid' required minlength='1' maxlength='32' pattern='[ -~]*' title='ASCII characters only' value='";
   html += htmlEscape(apSSID);
   html += "'>";
   html += "</div>";
@@ -1843,7 +1974,7 @@ void handleRoot()
 
   html += "<div class='field'>";
   html += "<label class='field__label' for='webuser'>Username</label>";
-  html += "<input class='field__input' type='text' id='webuser' name='webuser' required minlength='1' maxlength='32' value='";
+  html += "<input class='field__input' type='text' id='webuser' name='webuser' required minlength='1' maxlength='32' pattern='[ -~]*' title='ASCII characters only' value='";
   html += htmlEscape(webUser);
   html += "'>";
   html += "</div>";
@@ -1851,7 +1982,7 @@ void handleRoot()
   html += "<div class='field'>";
   html += "<label class='field__label' for='webpass'>Password</label>";
   html += "<div class='password-field'>";
-  html += "<input class='field__input password-field__input' type='password' id='webpass' name='webpass' required minlength='1' maxlength='32' value='";
+  html += "<input class='field__input password-field__input' type='password' id='webpass' name='webpass' required minlength='1' maxlength='32' pattern='[ -~]*' title='ASCII characters only' value='";
   html += htmlEscape(webPass);
   html += "'>";
   html += "<label class='password-field__toggle'><input type='checkbox' onchange=\"togglePassword('webpass', this.checked)\"> Show</label>";
@@ -1955,8 +2086,9 @@ void handleSave()
   }
 
   // WiFi networks. Empty SSID/password is valid (0 bytes) - it
-  // marks the slot unused/open. Anything over the 32-byte limit is
-  // rejected outright, leaving the previously stored value in place.
+  // marks the slot unused/open. Anything over the 32-byte limit, or
+  // containing a non-ASCII character, is rejected outright, leaving
+  // the previously stored value in place.
 
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++)
   {
@@ -1967,7 +2099,7 @@ void handleSave()
     {
       String newSSID = server.arg(ssidName);
 
-      if (newSSID.length() <= 32)
+      if (newSSID.length() <= 32 && isPrintableAscii(newSSID))
       {
         wifiSSID[i] = newSSID;
       }
@@ -1977,32 +2109,34 @@ void handleSave()
     {
       String newPassword = server.arg(passName);
 
-      if (newPassword.length() <= 32)
+      if (newPassword.length() <= 32 && isPrintableAscii(newPassword))
       {
         wifiPassword[i] = newPassword;
       }
     }
   }
 
-  // AP SSID: required, 1-32 bytes.
+  // AP SSID: required, 1-32 bytes, printable ASCII.
 
   if (server.hasArg("apssid"))
   {
     String newAPSSID = server.arg("apssid");
 
-    if (newAPSSID.length() >= 1 && newAPSSID.length() <= 32)
+    if (newAPSSID.length() >= 1 && newAPSSID.length() <= 32 &&
+        isPrintableAscii(newAPSSID))
     {
       apSSID = newAPSSID;
     }
   }
 
-  // Web credentials: required, 1-32 bytes each.
+  // Web credentials: required, 1-32 bytes each, printable ASCII.
 
   if (server.hasArg("webuser"))
   {
     String newWebUser = server.arg("webuser");
 
-    if (newWebUser.length() >= 1 && newWebUser.length() <= 32)
+    if (newWebUser.length() >= 1 && newWebUser.length() <= 32 &&
+        isPrintableAscii(newWebUser))
     {
       webUser = newWebUser;
     }
@@ -2012,21 +2146,24 @@ void handleSave()
   {
     String newWebPass = server.arg("webpass");
 
-    if (newWebPass.length() >= 1 && newWebPass.length() <= 32)
+    if (newWebPass.length() >= 1 && newWebPass.length() <= 32 &&
+        isPrintableAscii(newWebPass))
     {
       webPass = newWebPass;
     }
   }
 
-  // Node name: required, 1-17 bytes. Rejected outright rather than
-  // truncated, so an oversized submission never silently mutates
-  // into something the user didn't type.
+  // Node name: required, 1-17 bytes, printable ASCII. Rejected
+  // outright rather than truncated, so an oversized or non-ASCII
+  // submission never silently mutates into something the user
+  // didn't type.
 
   if (server.hasArg("nodename"))
   {
     String newNodeName = server.arg("nodename");
 
-    if (newNodeName.length() >= 1 && newNodeName.length() <= 17)
+    if (newNodeName.length() >= 1 && newNodeName.length() <= 17 &&
+        isPrintableAscii(newNodeName))
     {
       artnetNodeName = newNodeName;
     }
@@ -2176,6 +2313,22 @@ void setup()
 #endif
 
   // ----------------------------------------------------------
+  // Configuration
+  // ----------------------------------------------------------
+
+  loadConfiguration();
+
+  // Preferences are open at this point (loadConfiguration() calls
+  // preferences.begin()), so this can safely read/clear the
+  // one-shot reset-reason flag written by handleSave()/handleDiscard().
+  bootResetReasonText = determineResetReason();
+
+#if DEBUG
+  DBG_PRINT("[STATUS] Last reset reason: ");
+  DBG_PRINTLN(bootResetReasonText);
+#endif
+
+  // ----------------------------------------------------------
   // WiFi
   // ----------------------------------------------------------
 
@@ -2189,17 +2342,7 @@ void setup()
   // control can work while broadcast-based discovery does not.
   WiFi.setSleep(false);
 
-  loadConfiguration();
-
-  // Preferences are open at this point (loadConfiguration() calls
-  // preferences.begin()), so this can safely read/clear the
-  // one-shot reset-reason flag written by handleSave()/handleDiscard().
-  bootResetReasonText = determineResetReason();
-
 #if DEBUG
-  DBG_PRINT("[STATUS] Last reset reason: ");
-  DBG_PRINTLN(bootResetReasonText);
-
   DBG_PRINTLN("[WIFI] Attempting saved networks...");
 #endif
 

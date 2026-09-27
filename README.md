@@ -6,7 +6,7 @@ Two-relay ESP32 controller for simple on/off lighting control via **Art-Net 4 / 
 
 ## Features
 
-* Art-Net 4 / DMX over WiFi
+* Art-Net* 4 / DMX over WiFi
 * Two onboard relay outputs
 * Mains powered
 * Configurable DMX channels
@@ -17,6 +17,8 @@ Two-relay ESP32 controller for simple on/off lighting control via **Art-Net 4 / 
 * Persistent configuration across reboots
 * Serial debugging
 * Lightweight implementation with no unnecessary functionality
+
+*Art-Net™ Designed by and Copyright Artistic Licence Engineering Ltd
 
 ## Hardware
 

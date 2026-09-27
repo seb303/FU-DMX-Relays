@@ -100,7 +100,7 @@ Art-Net packet processing should not block network, web interface, or WiFi-manag
 
 ## 4. WiFi
 
-The controller must support connection to secure WiFi networks.
+The controller must support connection to secure WiFi networks, and provide an open access point as a fallback.
 
 Up to three WiFi network configurations can be stored.
 
@@ -119,7 +119,6 @@ On boot:
 2. If unsuccessful, attempt network 2.
 3. Continue through all configured networks until a successful connection.
 4. If none are available, start the fallback open access point.
-5. The fallback access point has no password and provides DHCP.
 
 The connection process should have sensible connection timeouts so that an unavailable network does not prevent the controller from progressing to the next configured network.
 
@@ -134,7 +133,11 @@ If the controller successfully connects to a configured WiFi network and the con
 
 The fallback access point is a boot-time fallback only.
 
-### WiFi mode
+### Fallback access point
+
+The fallback access point is has no password and provides DHCP. The device will have a fixed IP of 192.168.4.1 on subnet 192.168.4.0/24.
+
+### Web interface
 
 The web interface should report the current WiFi mode, IP address and SSID or fallback access point mode.
 
@@ -159,7 +162,8 @@ The main interface should display:
 - WiFi signal strength (RSSI)
 - Uptime (time since last reset/boot)
 - Reason for last reset/boot (power-on, configuration change, watchdog timeout, brownout, panic, etc.)
-- Time since last Art-Net packet (snapshot when web page loaded)
+- Time since last DMX data received for the configured universe (snapshot when web page loaded)
+- Time since last ArtPoll targetting the node (snapshot when web page loaded)
 - State of relay outputs (snapshot when web page loaded)
 
 ### Configuration
