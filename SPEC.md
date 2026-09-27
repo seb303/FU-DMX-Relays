@@ -12,11 +12,22 @@ The specific control application used will be [Radig DMX Control](https://www.ul
 
 ### Hardware
 
-Board:
+#### Board
+
 - ESP32-based 2-relay board
 - eBay listing: https://www.ebay.co.uk/itm/277016777105
 
-Relay outputs:
+#### Features
+
+- ESP32-32E module on board, 4M Byte flash
+- ESP32 module I/O port and UART program download port all lead out, convenient for secondary development
+- On-board AC-DC switching power supply module, supporting AC 90-250V
+- On-board RST reset button and IO0 programmable button
+- 2 on-board 5V relay, the output switch signal, suitable for controlling the control voltage of AC 250V/DC30V loads
+- 1 programmable LED and 2 relay indicators on board
+
+#### Relay outputs
+
 - Relay 1: GPIO16 (outer-side relay)
 - Relay 2: GPIO17 (inner-side relay)
 
