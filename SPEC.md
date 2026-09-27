@@ -8,7 +8,7 @@ The software receives Art-Net 4 / DMX data over WiFi and uses two DMX channels t
 
 The controller is intended for simple, reliable control of two on/off lighting outputs. The implementation should remain lightweight and avoid unnecessary functionality.
 
-The specific control application used will be Radig DMX Control, but the firmware should also work with any Art-Net application.
+The specific control application used will be [Radig DMX Control](https://www.ulrichradig.de/home/index.php/software/radig-dmx-control), but the firmware should also work with any Art-Net application.
 
 ### Hardware
 
