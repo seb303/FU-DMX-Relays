@@ -1,0 +1,7 @@
+.vscode/
+*.bin
+*.elf
+*.map
+*.eep
+build/
+internal_notes/
