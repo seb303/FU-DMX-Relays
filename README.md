@@ -2,7 +2,7 @@
 
 Two-relay ESP32 controller for simple on/off lighting control via **Art-Net 4 / DMX over WiFi**.
 
-![ESP32 Art-Net Relay Controller PCB](board.jpg)
+![ESP32 Art-Net Relay Controller PCB](photos/board-00.jpg)
 
 ## Features
 
