@@ -31,6 +31,10 @@ The specific control application used will be [Radig DMX Control](https://www.ul
 - Relay 1: GPIO16 (outer-side relay)
 - Relay 2: GPIO17 (inner-side relay)
 
+#### Status LED
+
+- On-board programmable LED: GPIO23
+
 ### Communications
 
 - Art-Net 4 over WiFi
@@ -132,6 +136,8 @@ If the controller successfully connects to a configured WiFi network and the con
 4. Continue attempting until a configured network becomes available.
 
 The fallback access point is a boot-time fallback only.
+
+Art-Net processing (ArtPoll replies and ArtDMX reception) is active in fallback access point mode in the same way as in station mode, so a controller connected directly to the access point can control the relays.
 
 ### Fallback access point
 
@@ -310,7 +316,7 @@ For example:
 The intended startup sequence is:
 
 1. Initialise serial debugging.
-2. Initialise GPIOs.
+2. Initialise GPIOs (relays and status LED).
 3. Set both relays to initial state Off.
 4. Load configuration from non-volatile storage.
 5. Display configuration if `DEBUG` is enabled.
@@ -323,6 +329,7 @@ The intended startup sequence is:
 9. If no configured network connects:
     - Start the fallback access point.
     - Start DHCP.
+    - Start Art-Net processing.
     - Start the web interface.
 10. Continue monitoring the WiFi connection.
 11. If an established connection is lost:
@@ -348,6 +355,27 @@ While attempting to connect to WiFi networks, blocking is acceptable since the w
 The state of the relays must remain unchanged in case of partial packet received (packet not containing relay channel), network failure, and while reconnection is being attempted.
 
 No DMX timeout shall be applied. If Art-Net communication stops, each relay shall retain its last known state indefinitely until a valid ArtDMX packet changes it.
+
+### Status LED
+
+The on-board LED on GPIO23 indicates the operating state of the controller. The first matching condition in the following table applies:
+
+| Priority | Condition | LED pattern |
+|:-:|---|---|
+| 1 | Attempting to connect to WiFi networks (at boot or during reconnection) | Fast flash |
+| 2 | ArtDMX data received for the configured universe within the last 1 second | Solid on |
+| 3 | Fallback access point mode, and no such ArtDMX data within the last 1 second | Occasional flash (mostly off) |
+| 4 | Otherwise (powered on, no such ArtDMX data within the last 1 second) | Slow flash |
+
+Only ArtDMX packets for the configured universe count as received DMX data. ArtPoll packets and packets for other universes do not affect the LED.
+
+Flash timings:
+
+- Fast flash: 100ms on, 100ms off
+- Slow flash: 500ms on, 500ms off
+- Occasional flash: 100ms on once every 2 seconds
+
+The LED pattern must be generated without blocking the main loop.
 
 ---
 
@@ -402,8 +430,9 @@ Example:
 
     RELAY1_GPIO = 16
     RELAY2_GPIO = 17
+    STATUS_LED_GPIO = 23
 
-The relay GPIO assignments should not be scattered throughout the firmware.
+The relay and status LED GPIO assignments, and the LED on-level (polarity), should not be scattered throughout the firmware.
 
 ---
 

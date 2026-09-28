@@ -43,11 +43,32 @@
 const int RELAY_OUTER = 16;
 const int RELAY_INNER = 17;
 
+// On-board status LED. LED_ON_LEVEL is the GPIO level that lights the
+// LED; change only this if the LED turns out to be wired active-low.
+const int STATUS_LED = 23;
+const int LED_ON_LEVEL = HIGH;
+const int LED_OFF_LEVEL = (LED_ON_LEVEL == HIGH) ? LOW : HIGH;
+
 // Minimum time a relay must remain in a given state before it can
 // switch again, to protect the relay contacts from excessive wear
 // if the controlling DMX channel changes rapidly (e.g. a stray
 // strobe/chase effect pointed at this channel by mistake).
 const unsigned long RELAY_DWELL_MS = 200;
+
+// Status LED patterns. Each pattern is derived from millis() modulo
+// its period, so it needs no state and never blocks.
+//   Fast flash   - trying to connect to WiFi
+//   Solid        - ArtDMX received for the configured universe
+//                  within LED_DMX_ACTIVE_MS
+//   Occasional   - fallback access point mode, no recent DMX
+//   Slow flash   - otherwise (powered on, no recent DMX)
+const unsigned long LED_FAST_PERIOD_MS = 200;
+const unsigned long LED_FAST_ON_MS = 100;
+const unsigned long LED_SLOW_PERIOD_MS = 1000;
+const unsigned long LED_SLOW_ON_MS = 500;
+const unsigned long LED_AP_PERIOD_MS = 2000;
+const unsigned long LED_AP_ON_MS = 100;
+const unsigned long LED_DMX_ACTIVE_MS = 1000;
 
 // Maximum number of ArtPollReply sends that can be queued at once,
 // each with its own randomised send time. Sized generously for a
@@ -88,6 +109,10 @@ int currentNetwork = -1;
 int nextNetworkToTry = 0;
 
 bool wifiRecoveryActive = false;
+
+// True only while tryWiFiNetwork() is waiting on a connection attempt.
+// Used by the status LED (fast flash).
+bool wifiConnecting = false;
 
 unsigned long lastWiFiCheck = 0;
 
@@ -173,6 +198,7 @@ void stopArtNet();
 void handleArtNet();
 
 void startAccessPoint();
+void updateStatusLed();
 bool tryWiFiNetwork(int index);
 void connectToSavedNetworks();
 void startWiFiRecovery();
@@ -588,6 +614,40 @@ void saveConfiguration()
 }
 
 // ============================================================
+// STATUS LED
+// ============================================================
+
+// Highest priority first:
+//   1. Connecting to WiFi              -> fast flash
+//   2. DMX in configured universe <1s  -> solid
+//   3. Fallback access point mode      -> occasional flash
+//   4. Otherwise                       -> slow flash
+void updateStatusLed()
+{
+    unsigned long now = millis();
+    bool on;
+
+    if (wifiConnecting || wifiRecoveryActive)
+    {
+        on = (now % LED_FAST_PERIOD_MS) < LED_FAST_ON_MS;
+    }
+    else if (everReceivedArtDmx && (now - lastArtDmxMs) < LED_DMX_ACTIVE_MS)
+    {
+        on = true;
+    }
+    else if (accessPointMode)
+    {
+        on = (now % LED_AP_PERIOD_MS) < LED_AP_ON_MS;
+    }
+    else
+    {
+        on = (now % LED_SLOW_PERIOD_MS) < LED_SLOW_ON_MS;
+    }
+
+    digitalWrite(STATUS_LED, on ? LED_ON_LEVEL : LED_OFF_LEVEL);
+}
+
+// ============================================================
 // WIFI CONNECTION
 // ============================================================
 
@@ -609,6 +669,9 @@ bool tryWiFiNetwork(int index)
     DBG_PRINT(": ");
     DBG_PRINTLN(wifiSSID[index]);
 #endif
+
+    wifiConnecting = true;
+    updateStatusLed();
 
     WiFi.mode(WIFI_STA);
 
@@ -646,6 +709,7 @@ bool tryWiFiNetwork(int index)
             currentNetwork = index;
             hasConnectedToWiFi = true;
             accessPointMode = false;
+            wifiConnecting = false;
 
             // Keep WiFi power-save disabled once connected, so periodic
             // broadcast traffic (e.g. an Art-Net controller's ArtPoll)
@@ -657,8 +721,12 @@ bool tryWiFiNetwork(int index)
             return true;
         }
 
-        delay(100);
+        // Short poll interval so the fast LED flash stays accurate.
+        updateStatusLed();
+        delay(20);
     }
+
+    wifiConnecting = false;
 
 #if DEBUG
     DBG_PRINT("[WIFI] Failed to connect to: ");
@@ -727,6 +795,11 @@ void startAccessPoint()
     DBG_PRINT("[WIFI] AP IP: ");
     DBG_PRINTLN(WiFi.softAPIP());
 #endif
+
+    if (result)
+    {
+        startArtNet();
+    }
 }
 
 // ============================================================
@@ -844,7 +917,10 @@ void startArtNet()
         return;
     }
 
-    if (WiFi.status() != WL_CONNECTED)
+    // Art-Net runs either on a joined station connection or on the
+    // fallback access point. In AP mode the station interface is never
+    // associated, so WiFi.status() cannot be used as the test there.
+    if (!accessPointMode && WiFi.status() != WL_CONNECTED)
     {
 #if DEBUG_ARTNET
         ARTNET_PRINTLN("[ARTNET] Cannot start: WiFi is not connected.");
@@ -958,7 +1034,7 @@ void sendArtPollReply(IPAddress destination)
     packet[9] = 0x21;
 
     // Node IP address.
-    IPAddress ip = WiFi.localIP();
+    IPAddress ip = accessPointMode ? WiFi.softAPIP() : WiFi.localIP();
 
     packet[10] = ip[0];
     packet[11] = ip[1];
@@ -1676,12 +1752,15 @@ body {
 
 .status__label {
     color: var(--text-muted);
+    text-wrap: balance;
 }
 
 .status__value {
+    flex-shrink: 0;
+    max-width: 65%;
     font-weight: 500;
     text-align: right;
-    word-break: break-all;
+    overflow-wrap: anywhere;
 }
 
 .panel {
@@ -1855,7 +1934,7 @@ void handleRoot()
     html += htmlEscape(bootResetReasonText);
     html += "</span></div>";
 
-    html += "<div class='status__row'><span class='status__label'>Last DMX data</span><span class='status__value'>";
+    html += "<div class='status__row'><span class='status__label'>Last DMX data (configured universe)</span><span class='status__value'>";
     if (everReceivedArtDmx)
     {
         html += formatDuration(millis() - lastArtDmxMs) + " ago";
@@ -1866,7 +1945,7 @@ void handleRoot()
     }
     html += "</span></div>";
 
-    html += "<div class='status__row'><span class='status__label'>Last ArtPoll</span><span class='status__value'>";
+    html += "<div class='status__row'><span class='status__label'>Last ArtPoll (targeting node)</span><span class='status__value'>";
     if (everReceivedArtPoll)
     {
         html += formatDuration(millis() - lastArtPollMs) + " ago";
@@ -2307,9 +2386,14 @@ void setup()
     digitalWrite(RELAY_OUTER, LOW);
     digitalWrite(RELAY_INNER, LOW);
 
+    // Status LED starts off; updateStatusLed() drives it from here on.
+    pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, LED_OFF_LEVEL);
+
 #if DEBUG
     DBG_PRINTLN("[GPIO] Relay 1 GPIO16 = OFF");
     DBG_PRINTLN("[GPIO] Relay 2 GPIO17 = OFF");
+    DBG_PRINTLN("[GPIO] Status LED GPIO23 = OFF");
 #endif
 
     // ----------------------------------------------------------
@@ -2398,6 +2482,8 @@ void setup()
 
 void loop()
 {
+    updateStatusLed();
+
     server.handleClient();
 
     // Art-Net remains active while connected.
