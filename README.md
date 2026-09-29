@@ -26,8 +26,8 @@ ESP32-based two-relay board.
 
 | Relay   |   GPIO |
 | ------- | -----: |
-| Relay 1 | GPIO16 |
-| Relay 2 | GPIO17 |
+| Relay 1 | GPIO17 |
+| Relay 2 | GPIO16 |
 
 eBay listing: https://www.ebay.co.uk/itm/277016777105
 
