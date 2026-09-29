@@ -4,6 +4,10 @@ Two-relay ESP32 controller for simple on/off lighting control via **Art-Net 4 / 
 
 ![ESP32 Art-Net Relay Controller PCB](photos/board-00.jpg)
 
+The above board fitted inside a trailing mains extension lead. Note that the plug fuse has been changed to 3A, since the standard 13A fuse would exceed the rating of the relays.
+
+![ESP32 Art-Net Relay Controller PCB](photos/installed-01.jpg)
+
 ## Features
 
 * Art-Net* 4 / DMX over WiFi
