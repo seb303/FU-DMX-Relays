@@ -28,8 +28,8 @@ The specific control application used will be [Radig DMX Control](https://www.ul
 
 #### Relay outputs
 
-- Relay 1: GPIO16 (outer-side relay)
-- Relay 2: GPIO17 (inner-side relay)
+- Relay 1: GPIO17 (inner-side relay)
+- Relay 2: GPIO16 (outer-side relay)
 
 #### Status LED
 
@@ -50,8 +50,8 @@ The two relays are controlled directly from ESP32 GPIOs.
 
 | Relay | ESP32 GPIO | DMX channel |
 |---|---:|---:|
-| Relay 1 | GPIO16 | Configurable |
-| Relay 2 | GPIO17 | Configurable |
+| Relay 1 | GPIO17 | Configurable |
+| Relay 2 | GPIO16 | Configurable |
 
 The DMX channel assigned to each relay is configurable through the web interface.
 
@@ -115,6 +115,8 @@ Each configuration consists of:
 
 Open networks can be used by configuring an empty password.
 
+The hostname used when obtaining an IP address via DHCP shall match the configured Art-Net node name.
+
 ### Boot-time connection behaviour
 
 On boot:
@@ -142,6 +144,18 @@ Art-Net processing (ArtPoll replies and ArtDMX reception) is active in fallback 
 ### Fallback access point
 
 The fallback access point is has no password and provides DHCP. The device will have a fixed IP of 192.168.4.1 on subnet 192.168.4.0/24.
+
+#### Recovery while in fallback access point mode
+
+A brief power cut can cause both the WiFi router and this controller to reboot together, with the controller starting up faster and finding no configured network available, so it starts the fallback access point. Without a recovery mechanism it would then stay in access point mode indefinitely, even once the router comes back.
+
+While running as the fallback access point, the controller shall periodically scan for WiFi networks:
+
+1. If a configured network is found, attempt to connect to it.
+2. If the connection succeeds, stop the fallback access point and resume normal station operation.
+3. If the connection fails, or no configured network is found, resume the fallback access point and continue scanning periodically.
+
+This scanning must not stop the access point from working while it is in progress, and must not block Art-Net processing or the web interface.
 
 ### Web interface
 
@@ -428,9 +442,9 @@ Hardware-specific values should be defined in one place in the source code.
 
 Example:
 
-    RELAY1_GPIO = 16
-    RELAY2_GPIO = 17
-    STATUS_LED_GPIO = 23
+    RELAY_1 = 17
+    RELAY_2 = 16
+    STATUS_LED = 23
 
 The relay and status LED GPIO assignments, and the LED on-level (polarity), should not be scattered throughout the firmware.
 

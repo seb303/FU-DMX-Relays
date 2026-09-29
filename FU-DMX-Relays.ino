@@ -40,8 +40,9 @@
 // HARDWARE
 // ============================================================
 
-const int RELAY_OUTER = 16;
-const int RELAY_INNER = 17;
+// See SPEC.md for physical relay positions on board.
+const int RELAY_1 = 17;
+const int RELAY_2 = 16;
 
 // On-board status LED. LED_ON_LEVEL is the GPIO level that lights the
 // LED; change only this if the LED turns out to be wired active-low.
@@ -94,6 +95,11 @@ const int MAX_WIFI_NETWORKS = 3;
 const unsigned long CONNECT_TIMEOUT_MS = 10000;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 1000;
 
+// While running as the fallback access point, how often to scan for
+// a configured network having become available (e.g. the router
+// rebooting after a power cut, coming up after this controller did).
+const unsigned long AP_SCAN_INTERVAL_MS = 10000;
+
 String wifiSSID[MAX_WIFI_NETWORKS];
 String wifiPassword[MAX_WIFI_NETWORKS];
 
@@ -114,6 +120,10 @@ bool wifiRecoveryActive = false;
 // Used by the status LED (fast flash).
 bool wifiConnecting = false;
 
+// AP-mode network scan state (see handleAccessPointRecovery()).
+bool apScanInProgress = false;
+unsigned long lastApScanMs = 0;
+
 unsigned long lastWiFiCheck = 0;
 
 // ============================================================
@@ -129,8 +139,8 @@ const uint16_t ARTNET_PORT = 6454;
 uint16_t artnetUniverse = 1;
 
 // Individual DMX addresses for the two relays.
-uint16_t relayOuterDMXAddress = 1;
-uint16_t relayInnerDMXAddress = 2;
+uint16_t relay1DMXAddress = 1;
+uint16_t relay2DMXAddress = 2;
 
 // Single configured node name, used for both the Art-Net
 // ShortName and LongName fields.
@@ -198,6 +208,7 @@ void stopArtNet();
 void handleArtNet();
 
 void startAccessPoint();
+void handleAccessPointRecovery();
 void updateStatusLed();
 bool tryWiFiNetwork(int index);
 void connectToSavedNetworks();
@@ -510,8 +521,8 @@ void loadConfiguration()
 
     artnetUniverse = preferences.getUShort("universe", 1);
 
-    relayOuterDMXAddress = preferences.getUShort("dmx1", 1);
-    relayInnerDMXAddress = preferences.getUShort("dmx2", 2);
+    relay1DMXAddress = preferences.getUShort("dmx1", 1);
+    relay2DMXAddress = preferences.getUShort("dmx2", 2);
 
     // Safety validation.
 
@@ -520,14 +531,14 @@ void loadConfiguration()
         artnetUniverse = 0;
     }
 
-    if (relayOuterDMXAddress < 1 || relayOuterDMXAddress > 512)
+    if (relay1DMXAddress < 1 || relay1DMXAddress > 512)
     {
-        relayOuterDMXAddress = 1;
+        relay1DMXAddress = 1;
     }
 
-    if (relayInnerDMXAddress < 1 || relayInnerDMXAddress > 512)
+    if (relay2DMXAddress < 1 || relay2DMXAddress > 512)
     {
-        relayInnerDMXAddress = 2;
+        relay2DMXAddress = 2;
     }
 
     if (artnetNodeName.length() == 0)
@@ -555,10 +566,10 @@ void loadConfiguration()
     DBG_PRINTLN(artnetUniverse);
 
     DBG_PRINT("[CONFIG] Relay 1 DMX address: ");
-    DBG_PRINTLN(relayOuterDMXAddress);
+    DBG_PRINTLN(relay1DMXAddress);
 
     DBG_PRINT("[CONFIG] Relay 2 DMX address: ");
-    DBG_PRINTLN(relayInnerDMXAddress);
+    DBG_PRINTLN(relay2DMXAddress);
 
     DBG_PRINT("[CONFIG] MAC: ");
     DBG_PRINTLN(getMACString());
@@ -605,8 +616,8 @@ void saveConfiguration()
 
     preferences.putUShort("universe", artnetUniverse);
 
-    preferences.putUShort("dmx1", relayOuterDMXAddress);
-    preferences.putUShort("dmx2", relayInnerDMXAddress);
+    preferences.putUShort("dmx1", relay1DMXAddress);
+    preferences.putUShort("dmx2", relay2DMXAddress);
 
 #if DEBUG
     DBG_PRINTLN("[CONFIG] Configuration saved.");
@@ -767,6 +778,16 @@ void startAccessPoint()
 
     accessPointMode = true;
 
+    // Cancel/discard any scan left over from a previous AP session,
+    // and reset the recovery timer so the next scan waits a full
+    // interval rather than firing immediately.
+    if (apScanInProgress)
+    {
+        WiFi.scanDelete();
+        apScanInProgress = false;
+    }
+    lastApScanMs = millis();
+
     // WIFI_AP_STA rather than plain WIFI_AP: this keeps the station
     // interface initialised (even though it isn't associated to
     // anything) alongside the fallback AP. Without it,
@@ -799,6 +820,154 @@ void startAccessPoint()
     if (result)
     {
         startArtNet();
+    }
+}
+
+// ============================================================
+// ACCESS POINT RECOVERY (SCAN FOR A CONFIGURED NETWORK)
+// ============================================================
+
+// While in fallback access point mode, periodically scans for a
+// configured network coming back into range - e.g. after a brief
+// power cut where this controller boots faster than the router - and
+// switches out of access point mode if one is found.
+//
+// startAccessPoint() runs WIFI_AP_STA, so the station interface
+// remains available for scanning while the fallback AP continues
+// running. The scan shares the ESP32's WiFi radio with the AP, so
+// there may be brief interruptions to AP traffic while scanning.
+// Only if a matching configured network is found does
+// tryWiFiNetwork() switch to WIFI_STA and drop the AP.
+void handleAccessPointRecovery()
+{
+    if (!accessPointMode)
+    {
+        return;
+    }
+
+    if (apScanInProgress)
+    {
+        int16_t result = WiFi.scanComplete();
+
+        if (result == WIFI_SCAN_RUNNING)
+        {
+            return;
+        }
+
+        apScanInProgress = false;
+
+        int matchedIndex = -1;
+
+        if (result > 0)
+        {
+#if DEBUG
+            DBG_PRINT("[WIFI] AP-mode scan found ");
+            DBG_PRINT(result);
+            DBG_PRINTLN(" network(s).");
+#endif
+
+            for (int i = 0; i < result && matchedIndex < 0; i++)
+            {
+                String foundSSID = WiFi.SSID(i);
+
+                for (int n = 0; n < MAX_WIFI_NETWORKS; n++)
+                {
+                    if (wifiSSID[n].length() > 0 && wifiSSID[n] == foundSSID)
+                    {
+                        matchedIndex = n;
+                        break;
+                    }
+                }
+            }
+        }
+#if DEBUG
+        else if (result == 0)
+        {
+            DBG_PRINTLN("[WIFI] AP-mode scan found no networks.");
+        }
+        else
+        {
+            DBG_PRINTLN("[WIFI] AP-mode scan failed.");
+        }
+#endif
+
+        WiFi.scanDelete();
+
+        if (matchedIndex >= 0)
+        {
+#if DEBUG
+            DBG_PRINT("[WIFI] Configured network back in range: ");
+            DBG_PRINTLN(wifiSSID[matchedIndex]);
+            DBG_PRINTLN("[WIFI] Attempting to leave access point mode.");
+#endif
+
+            if (tryWiFiNetwork(matchedIndex))
+            {
+#if DEBUG
+                DBG_PRINTLN("[WIFI] Switched from access point to station mode.");
+#endif
+                return;
+            }
+
+#if DEBUG
+            DBG_PRINTLN("[WIFI] Connection attempt failed. Resuming access point.");
+#endif
+
+            // tryWiFiNetwork() switches to WIFI_STA on its way in,
+            // which drops the fallback AP - restart it since the
+            // connection attempt didn't succeed after all.
+            startAccessPoint();
+
+            return;
+        }
+
+        lastApScanMs = millis();
+
+        return;
+    }
+
+    if (millis() - lastApScanMs < AP_SCAN_INTERVAL_MS)
+    {
+        return;
+    }
+
+    bool anyConfigured = false;
+
+    for (int i = 0; i < MAX_WIFI_NETWORKS; i++)
+    {
+        if (wifiSSID[i].length() > 0)
+        {
+            anyConfigured = true;
+            break;
+        }
+    }
+
+    if (!anyConfigured)
+    {
+        lastApScanMs = millis();
+
+        return;
+    }
+
+#if DEBUG
+    DBG_PRINTLN("[WIFI] Scanning for configured networks (access point mode)...");
+#endif
+
+    int16_t scanStartResult = WiFi.scanNetworks(true, false);
+
+    if (scanStartResult == WIFI_SCAN_RUNNING)
+    {
+        apScanInProgress = true;
+    }
+    else
+    {
+#if DEBUG
+        DBG_PRINTLN("[WIFI] AP-mode scan failed to start.");
+#endif
+        // Leave apScanInProgress false and just retry after the next
+        // interval, rather than polling scanComplete() on a scan that
+        // never began.
+        lastApScanMs = millis();
     }
 }
 
@@ -940,10 +1109,10 @@ void startArtNet()
         ARTNET_PRINTLN(artnetUniverse);
 
         ARTNET_PRINT("[ARTNET] Relay 1 DMX address: ");
-        ARTNET_PRINTLN(relayOuterDMXAddress);
+        ARTNET_PRINTLN(relay1DMXAddress);
 
         ARTNET_PRINT("[ARTNET] Relay 2 DMX address: ");
-        ARTNET_PRINTLN(relayInnerDMXAddress);
+        ARTNET_PRINTLN(relay2DMXAddress);
 #endif
     }
     else
@@ -1284,10 +1453,10 @@ void sendArtPollReply(IPAddress destination)
         ARTNET_PRINTLN(artnetUniverse);
 
         ARTNET_PRINT("[ARTNET] Relay 1 DMX address: ");
-        ARTNET_PRINTLN(relayOuterDMXAddress);
+        ARTNET_PRINTLN(relay1DMXAddress);
 
         ARTNET_PRINT("[ARTNET] Relay 2 DMX address: ");
-        ARTNET_PRINTLN(relayInnerDMXAddress);
+        ARTNET_PRINTLN(relay2DMXAddress);
 #endif
     }
     else
@@ -1606,32 +1775,32 @@ void handleArtNet()
     // Relay 1
     // ----------------------------------------------------------
 
-    if (relayOuterDMXAddress >= 1 &&
-            relayOuterDMXAddress <= 512 &&
-            relayOuterDMXAddress <= dmxLength)
+    if (relay1DMXAddress >= 1 &&
+            relay1DMXAddress <= 512 &&
+            relay1DMXAddress <= dmxLength)
     {
-        static unsigned long relayOuterLastChangeMs = 0;
+        static unsigned long relay1LastChangeMs = 0;
 
-        uint8_t dmxValue = packet[18 + relayOuterDMXAddress - 1];
+        uint8_t dmxValue = packet[18 + relay1DMXAddress - 1];
         bool newState = dmxValue > 0;
-        bool currentState = digitalRead(RELAY_OUTER) == HIGH;
+        bool currentState = digitalRead(RELAY_1) == HIGH;
 
         if (newState != currentState)
         {
-            if (millis() - relayOuterLastChangeMs >= RELAY_DWELL_MS)
+            if (millis() - relay1LastChangeMs >= RELAY_DWELL_MS)
             {
                 digitalWrite(
-                    RELAY_OUTER,
+                    RELAY_1,
                     newState ? HIGH : LOW
                 );
 
-                relayOuterLastChangeMs = millis();
+                relay1LastChangeMs = millis();
 
 #if DEBUG_ARTNET
                 ARTNET_PRINT("[ARTNET] Relay 1 state changed: ");
                 ARTNET_PRINT(newState ? "OFF -> ON" : "ON -> OFF");
                 ARTNET_PRINT(" (DMX ");
-                ARTNET_PRINT(relayOuterDMXAddress);
+                ARTNET_PRINT(relay1DMXAddress);
                 ARTNET_PRINT(" = ");
                 ARTNET_PRINT(dmxValue);
                 ARTNET_PRINTLN(")");
@@ -1650,32 +1819,32 @@ void handleArtNet()
     // Relay 2
     // ----------------------------------------------------------
 
-    if (relayInnerDMXAddress >= 1 &&
-            relayInnerDMXAddress <= 512 &&
-            relayInnerDMXAddress <= dmxLength)
+    if (relay2DMXAddress >= 1 &&
+            relay2DMXAddress <= 512 &&
+            relay2DMXAddress <= dmxLength)
     {
-        static unsigned long relayInnerLastChangeMs = 0;
+        static unsigned long relay2LastChangeMs = 0;
 
-        uint8_t dmxValue = packet[18 + relayInnerDMXAddress - 1];
+        uint8_t dmxValue = packet[18 + relay2DMXAddress - 1];
         bool newState = dmxValue > 0;
-        bool currentState = digitalRead(RELAY_INNER) == HIGH;
+        bool currentState = digitalRead(RELAY_2) == HIGH;
 
         if (newState != currentState)
         {
-            if (millis() - relayInnerLastChangeMs >= RELAY_DWELL_MS)
+            if (millis() - relay2LastChangeMs >= RELAY_DWELL_MS)
             {
                 digitalWrite(
-                    RELAY_INNER,
+                    RELAY_2,
                     newState ? HIGH : LOW
                 );
 
-                relayInnerLastChangeMs = millis();
+                relay2LastChangeMs = millis();
 
 #if DEBUG_ARTNET
                 ARTNET_PRINT("[ARTNET] Relay 2 state changed: ");
                 ARTNET_PRINT(newState ? "OFF -> ON" : "ON -> OFF");
                 ARTNET_PRINT(" (DMX ");
-                ARTNET_PRINT(relayInnerDMXAddress);
+                ARTNET_PRINT(relay2DMXAddress);
                 ARTNET_PRINT(" = ");
                 ARTNET_PRINT(dmxValue);
                 ARTNET_PRINTLN(")");
@@ -1957,11 +2126,11 @@ void handleRoot()
     html += "</span></div>";
 
     html += "<div class='status__row'><span class='status__label'>Relay 1</span><span class='status__value'>";
-    html += (digitalRead(RELAY_OUTER) == HIGH) ? "ON" : "OFF";
+    html += (digitalRead(RELAY_1) == HIGH) ? "ON" : "OFF";
     html += "</span></div>";
 
     html += "<div class='status__row'><span class='status__label'>Relay 2</span><span class='status__value'>";
-    html += (digitalRead(RELAY_INNER) == HIGH) ? "ON" : "OFF";
+    html += (digitalRead(RELAY_2) == HIGH) ? "ON" : "OFF";
     html += "</span></div>";
 
     html += "</div>";
@@ -1992,14 +2161,14 @@ void handleRoot()
     html += "<div class='field'>";
     html += "<label class='field__label' for='dmx1'>Relay 1 DMX Address (1-512)</label>";
     html += "<input class='field__input' type='number' id='dmx1' name='dmx1' required min='1' max='512' value='";
-    html += String(relayOuterDMXAddress);
+    html += String(relay1DMXAddress);
     html += "'>";
     html += "</div>";
 
     html += "<div class='field'>";
     html += "<label class='field__label' for='dmx2'>Relay 2 DMX Address (1-512)</label>";
     html += "<input class='field__input' type='number' id='dmx2' name='dmx2' required min='1' max='512' value='";
-    html += String(relayInnerDMXAddress);
+    html += String(relay2DMXAddress);
     html += "'>";
     html += "</div>";
 
@@ -2268,7 +2437,7 @@ void handleSave()
 
         if (value >= 1 && value <= 512)
         {
-            relayOuterDMXAddress = (uint16_t)value;
+            relay1DMXAddress = (uint16_t)value;
         }
     }
 
@@ -2280,7 +2449,7 @@ void handleSave()
 
         if (value >= 1 && value <= 512)
         {
-            relayInnerDMXAddress = (uint16_t)value;
+            relay2DMXAddress = (uint16_t)value;
         }
     }
 
@@ -2377,23 +2546,31 @@ void setup()
     // Relay outputs
     // ----------------------------------------------------------
 
-    pinMode(RELAY_OUTER, OUTPUT);
-    pinMode(RELAY_INNER, OUTPUT);
+    pinMode(RELAY_1, OUTPUT);
+    pinMode(RELAY_2, OUTPUT);
 
     // Relays are active HIGH.
     // Always start with both OFF.
 
-    digitalWrite(RELAY_OUTER, LOW);
-    digitalWrite(RELAY_INNER, LOW);
+    digitalWrite(RELAY_1, LOW);
+    digitalWrite(RELAY_2, LOW);
 
     // Status LED starts off; updateStatusLed() drives it from here on.
     pinMode(STATUS_LED, OUTPUT);
     digitalWrite(STATUS_LED, LED_OFF_LEVEL);
 
 #if DEBUG
-    DBG_PRINTLN("[GPIO] Relay 1 GPIO16 = OFF");
-    DBG_PRINTLN("[GPIO] Relay 2 GPIO17 = OFF");
-    DBG_PRINTLN("[GPIO] Status LED GPIO23 = OFF");
+    DBG_PRINT("[GPIO] Relay 1 GPIO");
+    DBG_PRINT(RELAY_1);
+    DBG_PRINTLN(" = OFF");
+
+    DBG_PRINT("[GPIO] Relay 2 GPIO");
+    DBG_PRINT(RELAY_2);
+    DBG_PRINTLN(" = OFF");
+
+    DBG_PRINT("[GPIO] Status LED GPIO");
+    DBG_PRINT(STATUS_LED);
+    DBG_PRINTLN(" = OFF");
 #endif
 
     // ----------------------------------------------------------
@@ -2415,6 +2592,15 @@ void setup()
     // ----------------------------------------------------------
     // WiFi
     // ----------------------------------------------------------
+
+    // The DHCP hostname must be set before WiFi is started.
+    WiFi.setHostname(artnetNodeName.c_str());
+    WiFi.softAPsetHostname(artnetNodeName.c_str());
+
+#if DEBUG
+    DBG_PRINT("[WIFI] Hostname: ");
+    DBG_PRINTLN(WiFi.getHostname());
+#endif
 
     WiFi.mode(WIFI_STA);
 
@@ -2495,6 +2681,10 @@ void loop()
 
     // Monitor the established WiFi connection.
     handleWiFiMonitor();
+
+    // While in fallback access point mode, periodically scan for a
+    // configured network having come back into range.
+    handleAccessPointRecovery();
 
     // If the connection has been lost, cycle through the saved
     // networks until one succeeds.
