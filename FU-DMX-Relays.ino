@@ -98,7 +98,13 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 1000;
 // While running as the fallback access point, how often to scan for
 // a configured network having become available (e.g. the router
 // rebooting after a power cut, coming up after this controller did).
-const unsigned long AP_SCAN_INTERVAL_MS = 10000;
+const unsigned long AP_SCAN_INTERVAL_MS = 30000;
+
+// A normal scan completes in a few seconds. If WiFi.scanComplete()
+// ever reports WIFI_SCAN_RUNNING for much longer than that - e.g. a
+// dropped WIFI_EVENT_SCAN_DONE, which can happen with concurrent
+// AP+STA scanning - treat it as stuck rather than waiting forever.
+const unsigned long AP_SCAN_MAX_AGE_MS = 15000;
 
 String wifiSSID[MAX_WIFI_NETWORKS];
 String wifiPassword[MAX_WIFI_NETWORKS];
@@ -123,6 +129,7 @@ bool wifiConnecting = false;
 // AP-mode network scan state (see handleAccessPointRecovery()).
 bool apScanInProgress = false;
 unsigned long lastApScanMs = 0;
+unsigned long apScanStartMs = 0;
 
 unsigned long lastWiFiCheck = 0;
 
@@ -239,6 +246,7 @@ void handleRoot();
 void handleSave();
 void handleDiscard();
 void handlePing();
+void handleNotFound();
 void logWebRequest();
 
 // ============================================================
@@ -724,7 +732,11 @@ bool tryWiFiNetwork(int index)
 
             // Keep WiFi power-save disabled once connected, so periodic
             // broadcast traffic (e.g. an Art-Net controller's ArtPoll)
-            // isn't at risk of being missed around DTIM beacons.
+            // isn't at risk of being missed around DTIM beacons. This
+            // setting isn't reliably persistent across a WiFi.mode()/
+            // WiFi.begin() cycle, so it's re-applied here on every
+            // successful connect (boot, WiFi recovery, and AP-mode
+            // recovery) rather than once in setup().
             WiFi.setSleep(false);
 
             startArtNet();
@@ -851,6 +863,19 @@ void handleAccessPointRecovery()
 
         if (result == WIFI_SCAN_RUNNING)
         {
+            if (millis() - apScanStartMs < AP_SCAN_MAX_AGE_MS)
+            {
+                return;
+            }
+
+#if DEBUG
+            DBG_PRINTLN("[WIFI] AP-mode scan stuck (no result after max wait). Resetting.");
+#endif
+
+            WiFi.scanDelete();
+            apScanInProgress = false;
+            lastApScanMs = millis();
+
             return;
         }
 
@@ -958,6 +983,7 @@ void handleAccessPointRecovery()
     if (scanStartResult == WIFI_SCAN_RUNNING)
     {
         apScanInProgress = true;
+        apScanStartMs = millis();
     }
     else
     {
@@ -2255,6 +2281,13 @@ void handleRoot()
     html += "</body>";
     html += "</html>";
 
+    // Tell the browser to close this connection rather than keep it
+    // open for reuse. The WebServer library only tracks one client
+    // connection at a time, so a browser holding a connection open
+    // (or opening several, e.g. alongside a /favicon.ico request)
+    // can otherwise make an unrelated subsequent request queue up
+    // behind it until the library's own close-wait period elapses.
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html", html);
 }
 
@@ -2467,6 +2500,7 @@ void handleSave()
         "The new settings have been saved. The node is rebooting to apply them."
     );
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html", html);
 
     delay(500);
@@ -2502,6 +2536,7 @@ void handleDiscard()
         "No changes were saved. The node is rebooting with its existing configuration."
     );
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html", html);
 
     delay(500);
@@ -2522,7 +2557,25 @@ void handlePing()
 {
     logWebRequest();
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/plain", "OK");
+}
+
+// ============================================================
+// NOT FOUND
+// ============================================================
+//
+// Replaces the WebServer library's own default not-found handler,
+// so unmatched requests (most commonly a browser's automatic
+// /favicon.ico request) also close the connection immediately
+// rather than potentially lingering.
+
+void handleNotFound()
+{
+    logWebRequest();
+
+    server.sendHeader("Connection", "close");
+    server.send(404, "text/plain", "Not found");
 }
 
 // ============================================================
@@ -2604,14 +2657,6 @@ void setup()
 
     WiFi.mode(WIFI_STA);
 
-    // Disable WiFi modem sleep. With power-save enabled, the ESP32
-    // radio can miss periodic broadcast/UDP traffic (such as an
-    // Art-Net controller's ArtPoll discovery broadcasts) because it
-    // is only awake around each DTIM beacon. Continuous unicast
-    // ArtDMX traffic is largely unaffected, which is why direct
-    // control can work while broadcast-based discovery does not.
-    WiFi.setSleep(false);
-
 #if DEBUG
     DBG_PRINTLN("[WIFI] Attempting saved networks...");
 #endif
@@ -2626,6 +2671,7 @@ void setup()
     server.on("/save", HTTP_POST, handleSave);
     server.on("/discard", HTTP_POST, handleDiscard);
     server.on("/ping", HTTP_GET, handlePing);
+    server.onNotFound(handleNotFound);
 
     server.begin();
 
