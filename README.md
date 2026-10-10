@@ -8,6 +8,10 @@ The image below shows the board fitted inside a trailing mains extension lead. N
 
 ![ESP32 Art-Net Relay Controller PCB](photos/installed-01.jpg)
 
+Unfortunately the cheap relays in the board had a tendency to weld the contacts closed when switching capacitive loads, so I swapped them out for a relay with different contact material (Finder 36.11.9.005.4011), and also added NTC inrush limiters in series with the load to further protect the contacts.
+
+![ESP32 Art-Net Relay Controller PCB](photos/installed-02.jpg)
+
 ## Features
 
 * Art-Net* 4 / DMX over WiFi
@@ -33,7 +37,10 @@ ESP32-based two-relay board.
 | Relay 1 | GPIO17 |
 | Relay 2 | GPIO16 |
 
-eBay listing: https://www.ebay.co.uk/itm/277016777105
+* eBay listing of board: https://www.ebay.co.uk/itm/277016777105
+* Replacement relays: Finder 36.11.9.005.4011
+* Inrush protection: TKS SCK-10502MS 50 Ohms 2A NTC Thermistor
+* Mains extension lead: Pro Elec PEL00514
 
 ## Documentation
 
