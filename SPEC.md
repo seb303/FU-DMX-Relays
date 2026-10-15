@@ -8,8 +8,6 @@ The software receives Art-Net 4 / DMX data over WiFi and uses two DMX channels t
 
 The controller is intended for simple, reliable control of two on/off lighting outputs. The implementation should remain lightweight and avoid unnecessary functionality.
 
-The specific control application used will be [Radig DMX Control](https://www.ulrichradig.de/home/index.php/software/radig-dmx-control), but the firmware should also work with any Art-Net application.
-
 ### Hardware
 
 #### Board
@@ -40,6 +38,7 @@ The specific control application used will be [Radig DMX Control](https://www.ul
 - Art-Net 4 over WiFi
 - DMX data carried within Art-Net
 - Web browser configuration interface
+- Firmware update via the web interface
 - Serial debugging via UART
 
 ---
@@ -66,7 +65,9 @@ The exact threshold behaviour should be defined as:
 
 This provides straightforward compatibility with lighting-control software and avoids requiring a specific dimmer level.
 
-There should be a minimum relay dwell time / anti-chatter guard of 200ms to prevent excessive wear to the relays from a rapidly changing control signal.
+There should be a minimum relay dwell time / anti-chatter guard of 500ms to prevent excessive wear to the relays from a rapidly changing control signal: after a relay changes state, it shall not change state again until at least 500ms have passed.
+
+A change requested during the dwell time is held back, not discarded. The controller keeps the state most recently requested by DMX data for each relay and applies it as soon as the dwell time has elapsed, without waiting for the sender to transmit the value again. If the requested state changes back before the dwell time has elapsed, the relay is not switched at all.
 
 ---
 
@@ -80,7 +81,7 @@ The Art-Net serial should be derived from the hardware MAC address and remain co
 
 The following Art-Net parameters are configurable via the web interface:
 
-- Node name (maximum 17 characters, used for both short and long name)
+- Node name (1 to 17 characters: letters, digits and hyphens only; used for both short and long name, the DHCP hostname, and the web interface title tag)
 - Universe
 - Relay 1 DMX channel
 - Relay 2 DMX channel
@@ -115,6 +116,8 @@ Each configuration consists of:
 
 Open networks can be used by configuring an empty password.
 
+Note that a hidden SSID will work at boot, but will not be found in a recovery scan.
+
 The hostname used when obtaining an IP address via DHCP shall match the configured Art-Net node name.
 
 ### Boot-time connection behaviour
@@ -126,7 +129,7 @@ On boot:
 3. Continue through all configured networks until a successful connection.
 4. If none are available, start the fallback open access point.
 
-The connection process should have sensible connection timeouts so that an unavailable network does not prevent the controller from progressing to the next configured network.
+The connection process should have sensible connection timeouts so that an unavailable network does not prevent the controller from progressing to the next configured network. An attempt shall also end as soon as the network refuses the stored credentials (for example, a wrong password), rather than waiting for the timeout, because retrying with the same credentials cannot succeed.
 
 ### Subsequent connection failure
 
@@ -135,7 +138,7 @@ If the controller successfully connects to a configured WiFi network and the con
 1. Do not start the fallback access point.
 2. Continually attempt to reconnect.
 3. Cycle through the configured WiFi networks in turn.
-4. Continue attempting until a configured network becomes available.
+4. Continue attempting until a configured network becomes available. Each connection cycle shall occur no more frequently than every 5 seconds (to avoid hammering the router if connection attempts are failing quickly).
 
 The fallback access point is a boot-time fallback only.
 
@@ -143,19 +146,27 @@ Art-Net processing (ArtPoll replies and ArtDMX reception) is active in fallback 
 
 ### Fallback access point
 
-The fallback access point is has no password and provides DHCP. The device will have a fixed IP of 192.168.4.1 on subnet 192.168.4.0/24.
+The fallback access point has no password and provides DHCP. The device will have a fixed IP of 192.168.4.1 on subnet 192.168.4.0/24.
 
 #### Recovery while in fallback access point mode
 
 A brief power cut can cause both the WiFi router and this controller to reboot together, with the controller starting up faster and finding no configured network available, so it starts the fallback access point. Without a recovery mechanism it would then stay in access point mode indefinitely, even once the router comes back.
 
-While running as the fallback access point, the controller shall periodically scan for WiFi networks:
+While running as the fallback access point, the controller shall periodically (every 30 seconds) scan for WiFi networks:
 
-1. If a configured network is found, attempt to connect to it.
-2. If the connection succeeds, stop the fallback access point and resume normal station operation.
-3. If the connection fails, or no configured network is found, resume the fallback access point and continue scanning periodically.
+1. If one or more configured networks are found, attempt to connect to each of them in turn, in the order they are configured, until one succeeds.
+2. If a connection succeeds, stop the fallback access point and resume normal station operation.
+3. If every connection attempt fails, or no configured network is found, resume the fallback access point and continue scanning periodically.
 
-This scanning must not stop the access point from working while it is in progress, and must not block Art-Net processing or the web interface.
+The scan runs in the background and must not block Art-Net processing or the web interface. Because the WiFi radio is shared with the access point, it may briefly interrupt traffic on the access point while the scan is in progress.
+
+Connecting to a network found by the scan is different: it stops the access point, and blocks Art-Net processing and the web interface for up to the connection timeout for each network attempted. The access point is only restarted once the attempts have finished and none succeeded.
+
+**Hold-off after refused credentials.** If a network refused the stored credentials (an authentication failure, such as a wrong password), the controller shall wait 3 minutes before the next scan instead of 30 seconds. This applies after a recovery attempt, and also from the moment the fallback access point is started after the connection attempts at startup. Each connection attempt takes the access point down, so without this, anyone connected to the access point to correct the WiFi credentials in the web interface would be disconnected over and over again; the 3 minutes gives them time to do so.
+
+Networks that were not found at all are ignored when deciding this. If any network that was tried failed in some other way (for example, by not answering within the timeout), the hold-off does not apply, because that network may be in range but unreachable and might recover on its own.
+
+This is a delay, not a lock-out. After 3 minutes recovery resumes as normal, so a router that only refused the password temporarily while it was starting up is still picked up.
 
 ### Web interface
 
@@ -175,15 +186,16 @@ The main interface should display:
 
 - MAC address
 - Art-Net serial
+- Firmware version
 - WiFi mode
 - IP address
 - Gateway IP address
 - Connected network SSID or indicate fallback access point mode
 - WiFi signal strength (RSSI)
 - Uptime (time since last reset/boot)
-- Reason for last reset/boot (power-on, configuration change, watchdog timeout, brownout, panic, etc.)
+- Reason for last reset/boot (power-on, configuration change, firmware update, watchdog timeout, brownout, panic, etc.)
 - Time since last DMX data received for the configured universe (snapshot when web page loaded)
-- Time since last ArtPoll targetting the node (snapshot when web page loaded)
+- Time since last ArtPoll targeting the node (snapshot when web page loaded)
 - State of relay outputs (snapshot when web page loaded)
 
 ### Configuration
@@ -217,17 +229,24 @@ Each WiFi password field shall have a control to show or hide the password chara
 - Username [default="admin"]
 - Password [default="admin"]
 
+#### Stored passwords
+
+The web interface never sends a stored password to the browser, neither the WiFi network passwords nor the web interface password. A password field that has a stored password shows ten placeholder characters instead, and its show/hide control is disabled because there is nothing to reveal.
+
+Saving the configuration without editing a password field leaves that stored password unchanged. As soon as the user types in the field, the placeholder is replaced by what they type, the show/hide control is enabled, and the new password is stored when the configuration is saved. A WiFi network that has no password (an open network) is shown with an empty field; to remove a stored WiFi password, clear its field.
+
 ### Actions
 
 The configuration interface shall provide a **Save & Reboot** button and a **Discard & Reboot** button.
 
 The **Save & Reboot** button shall:
 
-1. Confirm the Save & Reboot action
-2. Validate the submitted configuration.
-3. Store the configuration in non-volatile memory.
-4. Reboot the ESP32.
-5. Apply the new configuration during startup.
+1. Validate the entered configuration in the browser. If anything is invalid, report it and stop.
+2. Confirm the Save & Reboot action.
+3. Validate the submitted configuration on the server.
+4. Store the configuration in non-volatile memory.
+5. Reboot the ESP32.
+6. Apply the new configuration during startup.
 
 Configuration should not be changed permanently until the user selects Save & Reboot.
 
@@ -243,23 +262,71 @@ Configured values should be validated on the client-side, and prevent submission
 
 #### Art-Net
 
-- Node name => string, 1 to 17 bytes
+- Node name => string, 1 to 17 bytes: letters, digits and hyphens only, not starting or ending with a hyphen (it is also used as the DHCP hostname and the web interface title tag)
 - Art-Net Universe => integer, 0 to 32767
 - Relay 1 DMX channel => integer, 1 to 512
 - Relay 2 DMX channel => integer, 1 to 512
 
+Numeric values must consist of digits only. Anything else (including signs, decimal points and exponents such as `5e1`) is invalid and must not be interpreted as a number.
+
 #### WiFi
 
-- Fallback access point SSID => string, 1 to 32 bytes
-- WiFi network SSID => string, 0 to 32 bytes
-- WiFi network password => string, 0 to 32 bytes
+- Fallback access point SSID => string, 1 to 32 bytes, printable ASCII
+- WiFi network SSID => string, 0 to 32 bytes, printable ASCII
+- WiFi network password => empty (an open network), or 8 to 63 bytes. Any UTF-8 text is permitted, apart from control characters.
 
-Each WiFi password field shall have a control to show or hide the password characters.
+The password length is counted in bytes, not characters, because WPA/WPA2 and the ESP32 limit it in bytes: a character outside ASCII takes 2 to 4 bytes, so a password containing such characters has fewer characters available.
 
 #### Web interface authentication
 
-- Username => string, 1 to 32 bytes
-- Password => string, 1 to 32 bytes
+- Username => string, 1 to 32 bytes, printable ASCII
+- Password => string, 1 to 32 bytes, printable ASCII
+
+### Firmware version
+
+The firmware has a version string, defined in one place in the source code and displayed in the status information.
+
+The version string is the date and time of the last change to the source code, in the format `YYYY-MM-DD HH:MM`. It is updated by hand whenever the source code is changed.
+
+The version is also printed at startup when `DEBUG` is enabled.
+
+### Firmware update
+
+The firmware can be updated over the air from the web interface, as an alternative to a UART connection. The update is a compiled ESP32 application binary (`.bin`; the application image only, not an image that includes the bootloader).
+
+#### Availability
+
+Firmware update is only available while the controller is running in station mode and connected to a WiFi network that has a password configured.
+
+It is not available in fallback access point mode, or when connected to network without a configured password. In those cases the web interface does not offer the upload control, explains why, and the server rejects any update request.
+
+Authentication is still required, but the default web credentials (`admin` / `admin`) are acceptable: the secured WiFi network is what protects the controller from unauthorised updates.
+
+#### Update process
+
+1. The user selects a firmware file in the web interface.
+2. The browser checks the file's name and header (see below), and asks the user to confirm the update.
+3. The file is uploaded, with a progress indication.
+4. The controller verifies the received firmware.
+5. If the firmware is good, the controller reboots into it, and the web interface waits for the controller to return and then reloads the status page. The reason for last reset/boot is reported as a firmware update.
+6. If anything fails, an error is shown in the web interface and the controller carries on running the current firmware.
+
+The relays follow the normal reboot behaviour: they are switched off at startup, and are controlled again once DMX data is received.
+
+#### Protection against bad uploads
+
+Corrupt, truncated or wrong files must not be able to replace the working firmware. This must not require any extra step from the user, such as entering a checksum.
+
+- The new firmware is written to the inactive OTA partition, so the running firmware is not modified during the upload.
+- The browser, and again the controller, check the start of the file: it must begin with the ESP32 image magic byte `0xE9` and contain the application descriptor magic word `0xABCD5432` at offset 32. This rejects files that are not an application image, such as an image that includes the bootloader.
+- The new firmware is only activated if the ESP32 update library reports the whole image as complete and valid (`Update.end(true)` succeeds, which verifies the image's checksum and hash before switching the boot partition).
+- A write error, a failed verification, or the connection being lost during the upload aborts the update without changing which firmware boots.
+- Known limitation: there is no automatic rollback. An image that passes these checks but does not work (for example one that crashes at startup or cannot connect to WiFi) is not detected, and the controller does not revert to the previous firmware. Recovery in that case is by serial (UART) flashing.
+
+#### Runtime behaviour during an update
+
+- The status LED, Art-Net processing and ArtPoll replies continue to be serviced while the upload is received, so the relays keep following DMX data until the controller reboots.
+- The flash must have a partition scheme with two OTA application slots (the Arduino default 4MB scheme has two slots of about 1.25MB). The compiled binary must fit in one slot.
 
 ---
 
@@ -284,7 +351,8 @@ Controls general debugging information, including:
 - IP address
 - WiFi mode
 - Web server startup
-- Web requests
+- Web requests (verbose only)
+- Firmware version and firmware update progress and results
 - Reconnection attempts
 - Errors and other general diagnostic information
 
@@ -310,7 +378,7 @@ When disabled:
 
 When enabled:
 
-- Log requests to the web server
+- Log requests to the web server, and the size of the generated status page together with the free heap memory
 - Log every received Art-Net packet, including ArtPoll broadcasts, and each frame of DMX data
 
 These flags should be independent.
@@ -323,6 +391,22 @@ For example:
 #define DEBUG_VERBOSE 0
 ```
 
+### In-memory log and web interface panel
+
+When `DEBUG` or `DEBUG_ARTNET` is set, everything written to the serial debug output shall also be kept in a memory buffer, and shown in a **Debug Log** panel at the bottom of the web interface.
+
+- The buffer holds a fixed amount (16 KB) of the most recent output. When it is full, the oldest entries are discarded to make room for new ones.
+- Each line in the web log starts with the time since boot, in seconds. The serial output is unchanged.
+- The newest entry is at the bottom of the panel. The panel has a button to refresh it and an option to refresh it automatically every 2 seconds. Automatic refresh follows the newest output, unless the user has scrolled up to read earlier output.
+- A refresh fetches only the entries added since the previous one, and appends them to the entries already in the panel, so earlier entries remain in the page for as long as it stays loaded.
+- Where entries are missing, the panel shows "[older entries discarded]" on a line of its own. This is at the beginning, if entries had already been discarded from the buffer when the page was loaded; and between the previous entries and the new ones, if a refresh finds that entries have been discarded since the previous refresh.
+- If the controller has restarted since the previous refresh, the panel shows "*****  Rebooted *****" on a line of its own, with a blank line before it, between the previous entries and the entries from the new run.
+- The panel loads the log from a separate page, which requires the same authentication as the rest of the web interface. Requests for that page are not themselves logged, so that refreshing the panel does not fill the log.
+
+When both `DEBUG` and `DEBUG_ARTNET` are off, none of this exists: no memory is reserved for the buffer, the panel is not shown, and the log page is not served.
+
+Logging every received Art-Net packet (DEBUG_ARTNET together with DEBUG_VERBOSE) produces a lot of output, so the buffer may then hold only the last few seconds.
+
 ---
 
 ## 7. Startup Sequence
@@ -331,22 +415,21 @@ The intended startup sequence is:
 
 1. Initialise serial debugging.
 2. Initialise GPIOs (relays and status LED).
-3. Set both relays to initial state Off.
+3. Set relays and status LED to initial state Off.
 4. Load configuration from non-volatile storage.
-5. Display configuration if `DEBUG` is enabled.
-6. Initialise WiFi.
-7. Attempt configured WiFi networks in order.
-8. If a network connects:
+5. Initialise WiFi.
+6. Attempt configured WiFi networks in order.
+7. If a network connects:
     - Start normal WiFi/Station operation.
     - Start Art-Net processing.
     - Start the web interface.
-9. If no configured network connects:
+8. If no configured network connects:
     - Start the fallback access point.
     - Start DHCP.
     - Start Art-Net processing.
     - Start the web interface.
-10. Continue monitoring the WiFi connection.
-11. If an established connection is lost:
+9. Continue monitoring the WiFi connection.
+10. If an established connection is lost:
     - Attempt configured networks repeatedly.
     - Do not start the fallback AP.
 
@@ -377,11 +460,13 @@ The on-board LED on GPIO23 indicates the operating state of the controller. The 
 | Priority | Condition | LED pattern |
 |:-:|---|---|
 | 1 | Attempting to connect to WiFi networks (at boot or during reconnection) | Fast flash |
-| 2 | ArtDMX data received for the configured universe within the last 1 second | Solid on |
-| 3 | Fallback access point mode, and no such ArtDMX data within the last 1 second | Occasional flash (mostly off) |
-| 4 | Otherwise (powered on, no such ArtDMX data within the last 1 second) | Slow flash |
+| 2 | ArtDMX data received for the configured universe within the last 3 seconds | Solid on |
+| 3 | Fallback access point mode, and no such ArtDMX data within the last 3 seconds | Occasional flash (mostly off) |
+| 4 | Otherwise (powered on, no such ArtDMX data within the last 3 seconds) | Slow flash |
 
 Only ArtDMX packets for the configured universe count as received DMX data. ArtPoll packets and packets for other universes do not affect the LED.
+
+The 3 second window is deliberately longer than the 2 second refresh interval of the QLC+ controller that only resends unchanged DMX data every 2 seconds, so that the LED stays solid between refreshes.
 
 Flash timings:
 
@@ -397,7 +482,7 @@ The LED pattern must be generated without blocking the main loop.
 
 The controller must support WPA/WPA2-secured WiFi networks as supported by the ESP32 WiFi stack.
 
-The web interface must require authentication.
+The web interface must require authentication, except /ping which returns a static "OK".
 
 Default web credentials on first boot:
 
@@ -406,37 +491,11 @@ Default web credentials on first boot:
 
 Passwords should not be printed in serial debug output.
 
----
-
-## 10. Configuration Validation
-
-The web interface should validate configuration before saving.
-
-Examples:
-
-### Node name
-
-- Maximum 17 characters
-
-### Universe
-
-- Must be within the valid Art-Net universe range used by the implementation
-- 0 is also permitted, even though deprecated by the current standard
-
-### DMX channels
-
-- Must be valid DMX channel numbers
-- Relay 1 and Relay 2 may use the same or different channels
-
-### WiFi
-
-- Empty SSID entries should be ignored
-- Passwords should be stored exactly as entered
-- Invalid or incomplete entries should not prevent the remaining configured networks from being attempted
+Firmware updates through the web interface are only accepted when connected to a password-protected WiFi network, and never in fallback access point mode, as described in section 5.
 
 ---
 
-## 11. Hardware Constants
+## 10. Hardware Constants
 
 Hardware-specific values should be defined in one place in the source code.
 
@@ -450,7 +509,7 @@ The relay and status LED GPIO assignments, and the LED on-level (polarity), shou
 
 ---
 
-## 12. Non-Goals
+## 11. Non-Goals
 
 The firmware is intentionally intended to remain simple.
 
@@ -464,7 +523,6 @@ The following are not currently required:
 - Complex lighting effects
 - Relay dimming
 - Cloud connectivity
-- Remote firmware management
 - Mobile application
 - MQTT
 - Database
